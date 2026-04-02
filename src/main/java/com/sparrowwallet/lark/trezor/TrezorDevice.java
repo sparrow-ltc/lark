@@ -384,7 +384,7 @@ public class TrezorDevice implements Closeable, ProtocolCallbacks {
     }
 
     public String getCoinName(Network network) {
-        return network == Network.MAINNET ? "Bitcoin" : "Testnet";
+        return network == Network.MAINNET ? "Litecoin" : "Testnet";
     }
 
     public <T extends Message> T call(Message message, Class<T> toValueType) throws DeviceException {
