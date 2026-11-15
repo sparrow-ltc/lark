@@ -29,6 +29,7 @@ class V1Protocol implements Protocol {
 
     private static final int REPLEN = 64;
     private static final int TIMEOUT = 2000; // ms
+    private static final int MAX_MESSAGE_SIZE = 65536; // matches the 16 bit length field of the v2 (THP) packet header
     private static final int MAX_PASSPHRASE_LENGTH = 50;
     private static final int MAX_PIN_LENGTH = 50;
 
@@ -210,7 +211,7 @@ class V1Protocol implements Protocol {
         int messageType = TrezorMessage.MessageType.valueOf("MessageType_" + msgName).getNumber();
         byte[] messageBytes = message.toByteArray();
         if(log.isDebugEnabled()) {
-            log.debug("Type " + messageType + " (" + messageBytes.length + " bytes):" + Utils.bytesToHex(messageBytes));
+            log.debug("Type " + messageType + " (" + messageBytes.length + " bytes):" + (SECRET_MESSAGE_TYPES.contains(msgName) ? "<redacted>" : Utils.bytesToHex(messageBytes)));
         }
         messageWrite(messageType, messageBytes);
     }
@@ -287,7 +288,7 @@ class V1Protocol implements Protocol {
                     || readBytes[2] != (byte) '#') {
                 if(invalidChunksCounter++ > 5) {
                     if(log.isTraceEnabled()) {
-                        log.trace("< Header{}", Utils.bytesToHex(readBytes));
+                        log.trace("< Header{}", Utils.bytesToHex(Arrays.copyOf(readBytes, 9)));
                     }
                     throw new InvalidProtocolBufferException("Header invalid after multiple chunks");
                 }
@@ -297,7 +298,7 @@ class V1Protocol implements Protocol {
 
             // Must be OK to be here
             if(log.isTraceEnabled()) {
-                log.trace("< Header{}", Utils.bytesToHex(readBytes));
+                log.trace("< Header{}", Utils.bytesToHex(Arrays.copyOf(readBytes, 9)));
             }
 
             msgId = (((int) readBytes[3] & 0xFF) << 8) + ((int) readBytes[4] & 0xFF);
@@ -305,6 +306,15 @@ class V1Protocol implements Protocol {
                     + (((int) readBytes[6] & 0xFF) << 16)
                     + (((int) readBytes[7] & 0xFF) << 8)
                     + ((int) readBytes[8] & 0xFF);
+
+            // Check for an invalid message size before allocating a buffer for it
+            if(msgSize < 0 || msgSize > MAX_MESSAGE_SIZE) {
+                if(invalidChunksCounter++ > 5) {
+                    throw new InvalidProtocolBufferException("Header message size of " + msgSize + " bytes invalid after multiple chunks");
+                }
+                // Restart the loop
+                continue;
+            }
 
             // Allocate the message payload buffer
             messageBuffer = ByteBuffer.allocate(msgSize + 1024);
@@ -332,8 +342,8 @@ class V1Protocol implements Protocol {
 
         byte[] msgData = Arrays.copyOfRange(messageBuffer.array(), 0, msgSize);
 
-        if(log.isTraceEnabled()) {
-            log.trace("< Message{}", Utils.bytesToHex(msgData));
+        if(messageType == null) {
+            throw new InvalidProtocolBufferException("Unknown message type: " + msgId);
         }
 
         try {
@@ -343,9 +353,8 @@ class V1Protocol implements Protocol {
             if(log.isDebugEnabled()) {
                 String msgName = message.getClass().getSimpleName();
                 log.debug("< " + msgName);
-            }
-            if(log.isDebugEnabled()) {
-                log.debug("Type " + messageType.getNumber() + " (" + msgData.length + " bytes):" + Utils.bytesToHex(msgData));
+                log.debug("Type " + messageType.getNumber() + " (" + msgData.length + " bytes):" +
+                        (SECRET_MESSAGE_TYPES.contains(msgName) ? "<redacted>" : Utils.bytesToHex(msgData)));
             }
             return message;
         } catch(Exception ex) {

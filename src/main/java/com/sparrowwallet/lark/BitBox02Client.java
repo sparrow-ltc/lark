@@ -3,6 +3,7 @@ package com.sparrowwallet.lark;
 import com.google.protobuf.ByteString;
 import com.sparrowwallet.drongo.*;
 import com.sparrowwallet.drongo.crypto.ChildNumber;
+import com.sparrowwallet.drongo.crypto.ECDSASignature;
 import com.sparrowwallet.drongo.crypto.ECKey;
 import com.sparrowwallet.drongo.protocol.*;
 import com.sparrowwallet.drongo.psbt.PSBT;
@@ -43,7 +44,7 @@ public class BitBox02Client extends HardwareClient {
     private final ChildNumber PURPOSE_P2WPKH = ScriptType.P2WPKH.getDefaultDerivation().get(0);
     private final ChildNumber PURPOSE_P2WPKH_P2SH = ScriptType.P2SH_P2WPKH.getDefaultDerivation().get(0);
 
-    private final List<ScriptType> SUPPORTED_PUB_KEY_PATHS = List.of(ScriptType.P2SH_P2WPKH, ScriptType.P2WPKH, ScriptType.P2TR, ScriptType.P2SH_P2WSH, ScriptType.P2WSH);
+    private final List<ScriptType> SUPPORTED_SCRIPT_TYPES = List.of(ScriptType.P2SH_P2WPKH, ScriptType.P2WPKH, ScriptType.P2TR, ScriptType.P2SH_P2WSH, ScriptType.P2WSH);
 
     public BitBox02Client(HidDevice hidDevice) throws DeviceException {
         if(BITBOX02_ID.matches(hidDevice) && (hidDevice.getUsagePage() == 0xFFFF || hidDevice.getInterfaceNumber() == 0) &&
@@ -76,7 +77,7 @@ public class BitBox02Client extends HardwareClient {
      *
      * The BitBox02 has strict keypath validation.
      *
-     * The only accepted keypaths for xpubs are (as of firmware v9.4.0):
+     * The only accepted keypaths for xpubs are (as of firmware v9.19.0):
      *
      * - `m/49'/0'/<account'>` for `p2wpkh-p2sh` (segwit wrapped in P2SH)
      * - `m/84'/0'/<account'>` for `p2wpkh` (native segwit v0)
@@ -84,6 +85,7 @@ public class BitBox02Client extends HardwareClient {
      * - `m/48'/0'/<account'>/2'` for p2wsh multisig (native segwit v0 multisig).
      * - `m/48'/0'/<account'>/1'` for p2wsh-p2sh multisig (p2sh-wrapped segwit v0 multisig).
      * - `m/48'/0'/<account'>` for p2wsh and p2wsh-p2sh multisig.
+     * - `m/45'` and `m/45'/0'/<account'>` for non-standard derivation p2wsh and p2wsh-p2sh multisig (as of firmware v9.19.0).
      *
      * `account'` can be between `0'` and `99'`.
      *
@@ -92,7 +94,8 @@ public class BitBox02Client extends HardwareClient {
      *
      * In testnet mode, the second element must be `1'` (e.g. `m/49'/1'/...`).
      *
-     * Public keys for the Legacy address type (i.e. P2PKH and P2SH multisig) derivation path are unsupported.
+     * Public keys for the Legacy address type (i.e. P2PKH) derivation path are unsupported.
+     * Legacy P2SH multisig cannot be signed for, even though `m/45'` xpubs can be retrieved for segwit multisig.
      *
      * @param path the derivation path
      * @return the xpub at the derivation path
@@ -105,8 +108,13 @@ public class BitBox02Client extends HardwareClient {
         }
 
         try(BitBox02Device bitBox02Device = new BitBox02Device(hidDevice, new U2FHid(new HidPhysicalLayer(hidDevice)), noiseConfig)) {
+            //Firmware before 9.19.0 exports m/45' xpubs but cannot register or sign for a multisig account at that keypath
+            if(path.startsWith("m/45'")) {
+                bitBox02Device.requireAtLeastVersion(new Version("9.19.0"));
+            }
+
             Hww.Request.Builder request = Hww.Request.newBuilder();
-            request.setBtcPub(Btc.BTCPubRequest.newBuilder().setCoin(getCoin()).addAllKeypath(KeyDerivation.parsePath(path).stream().map(ChildNumber::i).toList())
+            request.setBtcPub(Btc.BTCPubRequest.newBuilder().setCoin(getCoin(bitBox02Device)).addAllKeypath(KeyDerivation.parsePath(path).stream().map(ChildNumber::i).toList())
                     .setXpubType(Network.get() == Network.MAINNET ? Btc.BTCPubRequest.XPubType.XPUB : Btc.BTCPubRequest.XPubType.TPUB).setDisplay(false));
             Hww.Response hwwResponse = bitBox02Device.msgQuery(request.build(), null);
             return ExtendedKey.fromDescriptor(hwwResponse.getPub().getPub());
@@ -114,7 +122,7 @@ public class BitBox02Client extends HardwareClient {
     }
 
     private boolean isValidPath(String path) {
-        for(ScriptType scriptType : SUPPORTED_PUB_KEY_PATHS) {
+        for(ScriptType scriptType : SUPPORTED_SCRIPT_TYPES) {
             int account = scriptType.getAccount(path);
             if(account >= 0 && account < 100) {
                 return true;
@@ -125,7 +133,16 @@ public class BitBox02Client extends HardwareClient {
             return true;
         }
 
+        if(path.equals("m/45'") || path.matches("m/45'/[01]'/\\d{1,2}'")) {
+            return true;
+        }
+
         return false;
+    }
+
+    @Override
+    public boolean supportsScriptType(ScriptType scriptType) {
+        return SUPPORTED_SCRIPT_TYPES.contains(scriptType);
     }
 
     /**
@@ -290,10 +307,9 @@ public class BitBox02Client extends HardwareClient {
             }
 
             List<Signature> sigs = btcSign(bitBox02Device, scriptConfigs, inputs, outputs, (int)psbt.getTransaction().getLocktime(), (int)psbt.getTransaction().getVersion());
-            for(int i = 0; i < sigs.size(); i++) {
-                Signature signature = sigs.get(i);
-                PSBTInput psbtInput = psbt.getPsbtInputs().get(i);
-                ECKey pubKey = foundPubKeys.get(i);
+            for(Signature signature : sigs) {
+                PSBTInput psbtInput = psbt.getPsbtInputs().get(signature.index());
+                ECKey pubKey = foundPubKeys.get(signature.index());
 
                 BigInteger r = new BigInteger(1, Arrays.copyOfRange(signature.signature, 0, 32));
                 BigInteger s = new BigInteger(1, Arrays.copyOfRange(signature.signature, 32, 64));
@@ -357,16 +373,23 @@ public class BitBox02Client extends HardwareClient {
      *
      */
     private List<Signature> btcSign(BitBox02Device bitBox02Device, List<Btc.BTCScriptConfigWithKeypath> scriptConfigs, List<TxInput> inputs, List<Object> outputs, int locktime, int version) throws DeviceException {
+        //Anti-klepto is required rather than gated, since a device reporting an older version would otherwise disable it
+        bitBox02Device.requireAtLeastVersion(new Version("9.4.0"));
+
         if(scriptConfigs.stream().anyMatch(this::isTaproot)) {
             bitBox02Device.requireAtLeastVersion(new Version("9.10.0"));
         }
 
+        //Firmware before 9.16.0 rejects any input carrying a relative timelock, as used by the BIP326 anti fee sniping scheme
+        if(inputs.stream().anyMatch(input -> input.sequence < TransactionInput.SEQUENCE_RBF_ENABLED)) {
+            bitBox02Device.requireAtLeastVersion(new Version("9.16.0"));
+        }
+
         List<Signature> sigs = new ArrayList<>();
-        boolean supportsAntiKlepto = (bitBox02Device.getVersion().compareTo(new Version("9.4.0")) >= 0);
 
         Hww.Request.Builder request = Hww.Request.newBuilder();
         request.setBtcSignInit(Btc.BTCSignInitRequest.newBuilder()
-                .setCoin(getCoin())
+                .setCoin(getCoin(bitBox02Device))
                 .addAllScriptConfigs(scriptConfigs)
                 .setVersion(version)
                 .setNumInputs(inputs.size())
@@ -391,7 +414,7 @@ public class BitBox02Client extends HardwareClient {
                         .setScriptConfigIndex(input.scriptConfigIndex);
 
                 boolean inputIsSchnorr = isTaproot(scriptConfigs.get(input.scriptConfigIndex));
-                boolean performAntiKlepto = supportsAntiKlepto && isInputsPass2 && !inputIsSchnorr;
+                boolean performAntiKlepto = isInputsPass2 && !inputIsSchnorr;
 
                 ByteString hostNonce = null;
                 if(performAntiKlepto) {
@@ -510,6 +533,69 @@ public class BitBox02Client extends HardwareClient {
     }
 
     /**
+     * Validates a compact ECDSA signature, then verifies the host nonce contribution to it.
+     *
+     * @param hostNonce the host nonce
+     * @param signerCommitment signed message
+     * @param signature the 64 byte compact signature
+     */
+    private void antiKleptoVerify(byte[] hostNonce, byte[] signerCommitment, byte[] signature) throws DeviceException {
+        verifyCompactSignature(signature);
+        verifyHostNonce(hostNonce, signerCommitment, signature);
+    }
+
+    /**
+     * Validates a recoverable ECDSA signature, then verifies the host nonce contribution to it.
+     *
+     * @param hostNonce the host nonce
+     * @param signerCommitment signed message
+     * @param signature the 65 byte recoverable signature
+     */
+    private void antiKleptoVerifyRecoverable(byte[] hostNonce, byte[] signerCommitment, byte[] signature) throws DeviceException {
+        verifyRecoverableSignature(signature);
+        verifyHostNonce(hostNonce, signerCommitment, signature);
+    }
+
+    /**
+     * Validates that a compact ECDSA signature is well formed, with both scalars in range and a low S value.
+     * Verifying the host nonce contribution only constrains R, so a device left free to choose between the low and high
+     * S encodings, or to return an out of range scalar, can still leak key material a bit at a time.
+     *
+     * @param signature the 64 byte compact signature
+     */
+    static void verifyCompactSignature(byte[] signature) throws DeviceException {
+        if(signature.length != 64) {
+            throw new DeviceException("Signature must be 64 bytes, not " + signature.length);
+        }
+
+        BigInteger r = new BigInteger(1, Arrays.copyOfRange(signature, 0, 32));
+        BigInteger s = new BigInteger(1, Arrays.copyOfRange(signature, 32, 64));
+        if(r.signum() <= 0 || r.compareTo(ECKey.CURVE_ORDER) >= 0 || s.signum() <= 0 || s.compareTo(ECKey.CURVE_ORDER) >= 0) {
+            throw new DeviceException("Signature contains a scalar outside the curve order");
+        }
+        if(!new ECDSASignature(r, s).isCanonical()) {
+            throw new DeviceException("Signature contains a high S value");
+        }
+    }
+
+    /**
+     * Validates that a recoverable ECDSA signature is well formed, with a valid compact signature and a recovery id in range.
+     * An unconstrained recovery id is both a further leak of key material and a source of malformed signature headers.
+     *
+     * @param signature the 65 byte recoverable signature
+     */
+    static void verifyRecoverableSignature(byte[] signature) throws DeviceException {
+        if(signature.length != 65) {
+            throw new DeviceException("Recoverable signature must be 65 bytes, not " + signature.length);
+        }
+
+        verifyCompactSignature(Arrays.copyOfRange(signature, 0, 64));
+        if(signature[64] < 0 || signature[64] > 3) {
+            throw new DeviceException("Signature contains an invalid recovery id of " + signature[64]);
+        }
+    }
+
+    /**
      * Verifies that hostNonce was used to tweak the nonce during signature
      * generation according to k' = k + H(signerCommitment, hostNonce) by checking that
      * k'*G = signerCommitment + H(signerCommitment, hostNonce)*G.
@@ -519,7 +605,7 @@ public class BitBox02Client extends HardwareClient {
      * @param signerCommitment signed message
      * @param signature the signature
      */
-    private void antiKleptoVerify(byte[] hostNonce, byte[] signerCommitment, byte[] signature) throws ECDSANonceException {
+    private void verifyHostNonce(byte[] hostNonce, byte[] signerCommitment, byte[] signature) throws ECDSANonceException {
         ECKey signerCommitmentKey = ECKey.fromPublicOnly(signerCommitment);
 
         //Compute R = R1 + H(R1, host_nonce)*G. R1 is the client nonce commitment.
@@ -599,10 +685,6 @@ public class BitBox02Client extends HardwareClient {
             throw new DeviceException("For message signing, the keypath bip44 purpose must be 84' or 49'");
         }
 
-        if(Network.get() != Network.MAINNET) {
-            throw new DeviceException("The BitBox02 only supports signing messages on mainnet");
-        }
-
         Btc.BTCScriptConfigWithKeypath btcScriptConfigWithKeypath = Btc.BTCScriptConfigWithKeypath.newBuilder()
                 .setScriptConfig(Btc.BTCScriptConfig.newBuilder().setSimpleType(btcScriptConfigType).build())
                 .addAllKeypath(fullPath.stream().map(ChildNumber::i).toList()).build();
@@ -614,43 +696,39 @@ public class BitBox02Client extends HardwareClient {
     }
 
     private byte[] btcSignMsg(BitBox02Device bitBox02Device, Btc.BTCScriptConfigWithKeypath btcScriptConfigWithKeypath, String message) throws DeviceException {
-        bitBox02Device.requireAtLeastVersion(new Version("9.2.0"));
+        //Message signing itself requires 9.2.0, but anti-klepto is required rather than gated, since a device reporting an older version would otherwise disable it
+        bitBox02Device.requireAtLeastVersion(new Version("9.5.0"));
+
+        //Firmware before 9.23.0 only signs messages on mainnet
+        if(Network.get() != Network.MAINNET) {
+            bitBox02Device.requireAtLeastVersion(new Version("9.23.0"));
+        }
 
         Btc.BTCSignMessageRequest.Builder signMessage = Btc.BTCSignMessageRequest.newBuilder()
-                .setCoin(getCoin())
+                .setCoin(getCoin(bitBox02Device))
                 .setScriptConfig(btcScriptConfigWithKeypath)
                 .setMsg(ByteString.copyFrom(message, StandardCharsets.UTF_8));
 
         Btc.BTCRequest.Builder btcRequest = Btc.BTCRequest.newBuilder();
 
-        ByteString signature;
+        byte[] nonce = new byte[32];
+        secureRandom.nextBytes(nonce);
+        signMessage.setHostNonceCommitment(Antiklepto.AntiKleptoHostNonceCommitment.newBuilder()
+                .setCommitment(ByteString.copyFrom(antiKleptoHostCommit(nonce))).build());
+        btcRequest.setSignMessage(signMessage.build());
 
-        boolean supportsAntiKlepto = (bitBox02Device.getVersion().compareTo(new Version("9.5.0")) >= 0);
-        if(supportsAntiKlepto) {
-            byte[] nonce = new byte[32];
-            secureRandom.nextBytes(nonce);
-            signMessage.setHostNonceCommitment(Antiklepto.AntiKleptoHostNonceCommitment.newBuilder()
-                    .setCommitment(ByteString.copyFrom(antiKleptoHostCommit(nonce))).build());
-            btcRequest.setSignMessage(signMessage.build());
+        ByteString signerCommitment = bitBox02Device.btcMsgQuery(btcRequest.build(), Btc.BTCResponse.ResponseCase.ANTIKLEPTO_SIGNER_COMMITMENT)
+                .getAntikleptoSignerCommitment().getCommitment();
 
-            ByteString signerCommitment = bitBox02Device.btcMsgQuery(btcRequest.build(), Btc.BTCResponse.ResponseCase.ANTIKLEPTO_SIGNER_COMMITMENT)
-                    .getAntikleptoSignerCommitment().getCommitment();
+        btcRequest = Btc.BTCRequest.newBuilder().setAntikleptoSignature(Antiklepto.AntiKleptoSignatureRequest.newBuilder()
+                .setHostNonce(ByteString.copyFrom(nonce)));
 
-            btcRequest = Btc.BTCRequest.newBuilder().setAntikleptoSignature(Antiklepto.AntiKleptoSignatureRequest.newBuilder()
-                    .setHostNonce(ByteString.copyFrom(nonce)));
+        byte[] sigBytes = bitBox02Device.btcMsgQuery(btcRequest.build(), Btc.BTCResponse.ResponseCase.SIGN_MESSAGE).getSignMessage().getSignature().toByteArray();
+        antiKleptoVerifyRecoverable(nonce, signerCommitment.toByteArray(), sigBytes);
 
-            signature = bitBox02Device.btcMsgQuery(btcRequest.build(), Btc.BTCResponse.ResponseCase.SIGN_MESSAGE).getSignMessage().getSignature();
-            antiKleptoVerify(nonce, signerCommitment.toByteArray(), signature.toByteArray());
-
-            if(log.isDebugEnabled()) {
-                log.debug("Antiklepto nonce verification PASSED");
-            }
-        } else {
-            btcRequest.setSignMessage(signMessage.build());
-            signature = bitBox02Device.btcMsgQuery(btcRequest.build(), Btc.BTCResponse.ResponseCase.SIGN_MESSAGE).getSignMessage().getSignature();
+        if(log.isDebugEnabled()) {
+            log.debug("Antiklepto nonce verification PASSED");
         }
-
-        byte[] sigBytes = signature.toByteArray();
 
         ByteBuffer buf = ByteBuffer.allocate(65);
         buf.put((byte)(27 + 4 + sigBytes[64]));
@@ -710,7 +788,7 @@ public class BitBox02Client extends HardwareClient {
 
     private String displayAddress(BitBox02Device bitBox02Device, Btc.BTCScriptConfig scriptConfig, String path) throws DeviceException {
         Hww.Request.Builder request = Hww.Request.newBuilder();
-        request.setBtcPub(Btc.BTCPubRequest.newBuilder().setCoin(getCoin()).addAllKeypath(KeyDerivation.parsePath(path).stream().map(ChildNumber::i).toList())
+        request.setBtcPub(Btc.BTCPubRequest.newBuilder().setCoin(getCoin(bitBox02Device)).addAllKeypath(KeyDerivation.parsePath(path).stream().map(ChildNumber::i).toList())
                 .setScriptConfig(scriptConfig).setDisplay(true));
         Hww.Response hwwResponse = bitBox02Device.msgQuery(request.build(), null);
         return hwwResponse.getPub().getPub();
@@ -740,6 +818,11 @@ public class BitBox02Client extends HardwareClient {
     }
 
     private void registerScriptConfig(BitBox02Device bitBox02Device, Btc.BTCScriptConfig btcScriptConfig, List<Integer> keypath, String name) throws DeviceException {
+        //Firmware before 9.19.0 only accepts multisig accounts at m/48' keypaths, and the xpub may have been imported without being fetched from this device
+        if(!keypath.isEmpty() && keypath.getFirst() == new ChildNumber(45, true).i()) {
+            bitBox02Device.requireAtLeastVersion(new Version("9.19.0"));
+        }
+
         boolean isRegistered = isScriptConfigRegistered(bitBox02Device, btcScriptConfig, keypath);
         if(!isRegistered) {
             if(name.isEmpty()) {
@@ -751,7 +834,7 @@ public class BitBox02Client extends HardwareClient {
             }
 
             Btc.BTCScriptConfigRegistration scriptConfigRegistration = Btc.BTCScriptConfigRegistration.newBuilder()
-                    .setCoin(getCoin())
+                    .setCoin(getCoin(bitBox02Device))
                     .setScriptConfig(btcScriptConfig)
                     .addAllKeypath(keypath).build();
 
@@ -778,7 +861,7 @@ public class BitBox02Client extends HardwareClient {
         Btc.BTCRequest.Builder request = Btc.BTCRequest.newBuilder();
         request.setIsScriptConfigRegistered(Btc.BTCIsScriptConfigRegisteredRequest.newBuilder()
                 .setRegistration(Btc.BTCScriptConfigRegistration.newBuilder()
-                        .setCoin(getCoin())
+                        .setCoin(getCoin(bitBox02Device))
                         .setScriptConfig(btcScriptConfig)
                         .addAllKeypath(keypath)).build());
         Btc.BTCResponse response = bitBox02Device.btcMsgQuery(request.build(), Btc.BTCResponse.ResponseCase.IS_SCRIPT_CONFIG_REGISTERED);
@@ -794,8 +877,14 @@ public class BitBox02Client extends HardwareClient {
                 .setDepth(ByteString.copyFrom(ByteBuffer.allocate(1).put((byte)xpub.getKey().getDepth()).array())).build();
     }
 
-    private Btc.BTCCoin getCoin() {
-        return Network.get() == Network.MAINNET ? Btc.BTCCoin.BTC : Btc.BTCCoin.TBTC;
+    private Btc.BTCCoin getCoin(BitBox02Device bitBox02Device) {
+        if(Network.get() == Network.MAINNET) {
+            return Btc.BTCCoin.BTC;
+        } else if(Network.get() == Network.REGTEST && bitBox02Device.getVersion().compareTo(new Version("9.21.0")) >= 0) {
+            return Btc.BTCCoin.RBTC;
+        }
+
+        return Btc.BTCCoin.TBTC;
     }
 
     @Override

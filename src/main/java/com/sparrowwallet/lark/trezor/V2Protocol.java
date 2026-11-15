@@ -39,6 +39,7 @@ class V2Protocol implements Protocol {
     private final TrezorNoiseConfig credentialStore;
 
     // THP session state
+    private ChannelTransport channelTransport;
     private EncryptedTransport encryptedTransport;
     private HandshakeMessages.PairingState pairingState;
     private KeyPair hostStaticKeyPair;
@@ -129,6 +130,9 @@ class V2Protocol implements Protocol {
             log.debug("Channel allocated: 0x{}", String.format("%04X", allocationResponse.channelId));
         }
 
+        // The handshake and the encrypted transport that follows it share the channel's ABP state
+        this.channelTransport = new ChannelTransport(transport, allocationResponse.channelId);
+
         // Step 2: Load or generate host static key pair
         this.hostStaticKeyPair = loadOrGenerateHostStaticKey();
 
@@ -144,11 +148,7 @@ class V2Protocol implements Protocol {
         this.handshakeHash = handshakeResult.handshakeHash;
 
         // Step 5: Create encrypted transport
-        this.encryptedTransport = new EncryptedTransport(
-                transport,
-                handshakeResult.transport,
-                handshakeResult.channelId
-        );
+        this.encryptedTransport = new EncryptedTransport(channelTransport, handshakeResult.transport);
         this.pairingState = handshakeResult.pairingState;
 
         // Step 7: Save host static key
@@ -467,9 +467,6 @@ class V2Protocol implements Protocol {
 
         // Step 4: Prompt user for pairing code
         String pairingCode = credentialStore.promptForPairingCode();
-        if(log.isDebugEnabled()) {
-            log.debug("User entered pairing code: {}", pairingCode);
-        }
 
         if(pairingCode == null) {
             throw new UserRefusedException("User declined pairing code entry");
@@ -505,7 +502,7 @@ class V2Protocol implements Protocol {
 
         byte[] secretBytes = secret.getSecret().toByteArray();
         if(log.isDebugEnabled()) {
-            log.debug("Received CodeEntrySecret: {}", Utils.bytesToHex(secretBytes));
+            log.debug("Received CodeEntrySecret ({} bytes)", secretBytes.length);
         }
 
         // Step 7: Verify commitment using Sha256Hash
@@ -521,8 +518,7 @@ class V2Protocol implements Protocol {
         // Step 8: Verify pairing code matches derived value
         String derivedCode = CPace.deriveCode(secretBytes, handshakeHash, challenge);
         if(!derivedCode.equals(pairingCode)) {
-            throw new DeviceException("Pairing code mismatch - expected " + derivedCode +
-                                    " but user entered " + pairingCode);
+            throw new DeviceException("Pairing code mismatch - the code entered does not match the code shown on the device");
         }
 
         if(log.isDebugEnabled()) {
@@ -557,7 +553,7 @@ class V2Protocol implements Protocol {
         byte[] trezorPubkeyFromResponse = credResponse.getTrezorStaticPublicKey().toByteArray();
 
         if(log.isDebugEnabled()) {
-            log.debug("Received credential ({} bytes): {}", credentialBlob.length, Utils.bytesToHex(credentialBlob));
+            log.debug("Received credential ({} bytes)", credentialBlob.length);
             log.debug("Trezor pubkey from response: {}", Utils.bytesToHex(trezorPubkeyFromResponse));
         }
 
@@ -587,8 +583,7 @@ class V2Protocol implements Protocol {
             @Override
             public byte[] exchangeInitiation(byte[] request) throws DeviceException {
                 // Handshake uses the allocated channel, not broadcast
-                return sendAndReceiveHandshake(request, channelId,
-                        ControlByte.PacketType.HANDSHAKE_INIT_RESP);
+                return sendAndReceiveHandshake(request, ControlByte.PacketType.HANDSHAKE_INIT_RESP);
             }
 
             @Override
@@ -626,8 +621,7 @@ class V2Protocol implements Protocol {
             @Override
             public HandshakeStateMachine.CompletionResponse exchangeCompletion(byte[] request)
                     throws DeviceException {
-                byte[] response = sendAndReceiveHandshake(request, channelId,
-                        ControlByte.PacketType.HANDSHAKE_COMP_RESP);
+                byte[] response = sendAndReceiveHandshake(request, ControlByte.PacketType.HANDSHAKE_COMP_RESP);
                 return new HandshakeStateMachine.CompletionResponse(channelId, response);
             }
         };
@@ -638,121 +632,22 @@ class V2Protocol implements Protocol {
     /**
      * Send handshake message and receive response.
      */
-    private byte[] sendAndReceiveHandshake(byte[] payload, int channelId, ControlByte.PacketType expectedResponseType) throws DeviceException {
+    private byte[] sendAndReceiveHandshake(byte[] payload, ControlByte.PacketType expectedResponseType) throws DeviceException {
+        ControlByte.PacketType requestType = expectedResponseType == ControlByte.PacketType.HANDSHAKE_INIT_RESP ?
+                ControlByte.PacketType.HANDSHAKE_INIT_REQ : ControlByte.PacketType.HANDSHAKE_COMP_REQ;
+        channelTransport.sendMessage(requestType, payload);
 
-        // Determine control byte based on expected response
-        // Per THP spec, handshake messages have FIXED sequence bits:
-        // INIT_REQ/RESP: seq=0, COMP_REQ/RESP: seq=1
-        byte controlByte;
-        boolean isInitiation = (expectedResponseType == ControlByte.PacketType.HANDSHAKE_INIT_RESP);
-        if(isInitiation) {
-            controlByte = ControlByte.createHandshakeInitReq(false, false);  // seq=0, ack=0
-        } else {
-            controlByte = ControlByte.createHandshakeCompReq(true, false);   // seq=1, ack=0
-        }
-
-        // Send handshake message
-        for(byte[] packet : PacketCodec.segment(controlByte, channelId, payload)) {
-            transport.write(packet);
-        }
-
-        // ABP: After sending, we receive an ACK for our message
-        byte[] ackPacket = transport.read();
-        if(ackPacket == null || ackPacket.length != 64) {
-            throw new DeviceException("Invalid ACK packet");
-        }
-        ControlByte.PacketType ackType = ControlByte.getPacketType(ackPacket[0]);
-        boolean ackBit = ControlByte.getAckBit(ackPacket[0]);
-        boolean seqBit = ControlByte.getSequenceBit(ackPacket[0]);
+        PacketCodec.ReassembledMessage message = channelTransport.receiveMessage();
+        ControlByte.PacketType packetType = ControlByte.getPacketType(message.controlByte);
         if(log.isDebugEnabled()) {
-            log.debug("Received after sending request: type={}, seq={}, ack={}, control_byte=0x{}",
-                    ackType, seqBit, ackBit, String.format("%02X", ackPacket[0] & 0xFF));
+            log.debug("Received handshake response: {}", ControlByte.toString(message.controlByte));
         }
 
-        // Check if device sent TRANSPORT_ERROR instead of ACK
-        if(ackType == ControlByte.PacketType.TRANSPORT_ERROR) {
-            int errorCode = ackPacket[5] & 0xFF;
-            String errorName = getTransportErrorName(errorCode);
-            throw new DeviceException("Transport error on channel 0x" + String.format("%04X", channelId) + ": " + errorName + " (code " + errorCode + ")");
-        }
-
-        if(ackType != ControlByte.PacketType.ACK) {
-            throw new DeviceException("Expected ACK for sent message, got " + ackType +
-                    " (control_byte=0x" + String.format("%02X", ackPacket[0] & 0xFF) + ")");
-        }
-
-        // Receive the response
-        byte[] firstPacket = transport.read();
-        if(firstPacket == null || firstPacket.length != 64) {
-            throw new DeviceException("Invalid handshake response packet");
-        }
-
-        // Verify expected packet type
-        ControlByte.PacketType packetType = ControlByte.getPacketType(firstPacket[0]);
-        if(packetType == ControlByte.PacketType.TRANSPORT_ERROR) {
-            // Read error code (first byte of payload, at offset 5)
-            int errorCode = firstPacket[5] & 0xFF;
-            String errorName = getTransportErrorName(errorCode);
-            throw new DeviceException("Transport error during handshake on channel 0x" +
-                    String.format("%04X", channelId) + ": " + errorName + " (code " + errorCode + ")");
-        }
         if(packetType != expectedResponseType) {
             throw new DeviceException("Expected " + expectedResponseType + ", got " + packetType);
         }
 
-        // Reassemble response
-        java.util.List<byte[]> packets = new java.util.ArrayList<>();
-        packets.add(firstPacket);
-
-        int totalLength = PacketCodec.getLength(firstPacket);
-        int requiredPackets = calculateRequiredPackets(totalLength);
-
-        for(int i = 1; i < requiredPackets; i++) {
-            byte[] packet = transport.read();
-            if(packet == null || !ControlByte.isContinuation(packet[0])) {
-                throw new DeviceException("Invalid continuation packet in handshake");
-            }
-            packets.add(packet);
-        }
-
-        PacketCodec.ReassembledMessage message = PacketCodec.reassemble(packets);
-
-        // ABP: Send ACK for received message
-        byte ackControlByte = ControlByte.createAck(ControlByte.getSequenceBit(firstPacket[0]));
-        // ACK has empty payload, but still needs proper THP packet format with length and CRC
-        byte[] emptyPayload = new byte[0];
-        for(byte[] respAck : PacketCodec.segment(ackControlByte, channelId, emptyPayload)) {
-            transport.write(respAck);
-        }
-
         return message.applicationData;
-    }
-
-    /**
-     * Get transport error name from error code.
-     */
-    private static String getTransportErrorName(int errorCode) {
-        return switch(errorCode) {
-            case 1 -> "TRANSPORT_BUSY";
-            case 2 -> "UNALLOCATED_CHANNEL";
-            case 3 -> "DECRYPTION_FAILED";
-            case 5 -> "DEVICE_LOCKED";
-            default -> "UNKNOWN";
-        };
-    }
-
-    /**
-     * Calculate number of packets required for a message.
-     */
-    private int calculateRequiredPackets(int transportPayloadLength) {
-        // Length already includes CRC
-        int firstPacketPayload = 59;
-        if(transportPayloadLength <= firstPacketPayload) {
-            return 1;
-        }
-        int remainingBytes = transportPayloadLength - firstPacketPayload;
-        int continuationPacketPayload = 61;
-        return 1 + (remainingBytes + continuationPacketPayload - 1) / continuationPacketPayload;
     }
 
     // ===== Callback Handlers =====
@@ -868,7 +763,7 @@ class V2Protocol implements Protocol {
 
         if(log.isDebugEnabled()) {
             log.debug("> {} (type={}, {} bytes): {}", msgName, messageType, protobufBytes.length,
-                    Utils.bytesToHex(protobufBytes));
+                    SECRET_MESSAGE_TYPES.contains(msgName) ? "<redacted>" : Utils.bytesToHex(protobufBytes));
         }
 
         encryptedTransport.sendMessage(applicationData);
@@ -881,10 +776,6 @@ class V2Protocol implements Protocol {
 
         try {
             byte[] messageBytes = encryptedTransport.receiveMessage();
-
-            if(log.isDebugEnabled()) {
-                log.debug("< Message ({} bytes): {}", messageBytes.length, Utils.bytesToHex(messageBytes));
-            }
 
             // Parse THP message: session_id (1 byte) + type (2 bytes BE) + protobuf payload
             if(messageBytes.length < 3) {
@@ -910,10 +801,6 @@ class V2Protocol implements Protocol {
                 messageTypeName = thpMessageType.name();
             }
 
-            if(log.isDebugEnabled()) {
-                log.debug("< Session {} message type {} ({})", sessionId, msgId, messageTypeName);
-            }
-
             // Extract payload (skip 3-byte header)
             byte[] payload = new byte[messageBytes.length - 3];
             System.arraycopy(messageBytes, 3, payload, 0, payload.length);
@@ -925,6 +812,8 @@ class V2Protocol implements Protocol {
             if(log.isDebugEnabled()) {
                 String msgName = message.getClass().getSimpleName();
                 log.debug("< {}", msgName);
+                log.debug("< Session {} message type {} ({}, {} bytes): {}", sessionId, msgId, messageTypeName, messageBytes.length,
+                        SECRET_MESSAGE_TYPES.contains(msgName) ? "<redacted>" : Utils.bytesToHex(messageBytes));
             }
 
             return message;

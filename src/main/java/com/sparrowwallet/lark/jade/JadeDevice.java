@@ -382,12 +382,11 @@ public class JadeDevice implements Closeable {
                         String logLevel = logResponse.getString();
                         if(logLevel.length() > 1 && logLevel.charAt(1) == ' ') {
                             switch(logLevel.charAt(0)) {
-                                case 'E': log.error(logLevel);
-                                case 'W': log.warn(logLevel);
-                                case 'I': log.info(logLevel);
-                                case 'D': log.debug(logLevel);
-                                case 'V': log.trace(logLevel);
-                                default: log.error(logLevel);
+                                case 'W' -> log.warn(logLevel);
+                                case 'I' -> log.info(logLevel);
+                                case 'D' -> log.debug(logLevel);
+                                case 'V' -> log.trace(logLevel);
+                                default -> log.error(logLevel);
                             }
                         } else {
                             log.error(logLevel);
@@ -398,11 +397,11 @@ public class JadeDevice implements Closeable {
                 }
             }
         } catch(CborException e) {
-            String recieved = new String(cborMsg, StandardCharsets.UTF_8);
-            if(recieved.chars().allMatch(ch -> ch >= 0 && ch <= 127)) {
-                throw new DeviceException("Error decoding response from device, recieved " + new String(cborMsg, StandardCharsets.UTF_8), e);
+            String received = new String(cborMsg, StandardCharsets.UTF_8);
+            if(received.chars().allMatch(ch -> ch >= 0 && ch <= 127)) {
+                throw new DeviceException("Error decoding response from device, received " + received, e);
             } else {
-                throw new DeviceException("Error decoding response from device, recieved " + cborMsg.length + " bytes of " + Utils.bytesToHex(cborMsg), e);
+                throw new DeviceException("Error decoding response from device, received " + cborMsg.length + " bytes of " + Utils.bytesToHex(cborMsg), e);
             }
         }
 
@@ -466,10 +465,14 @@ public class JadeDevice implements Closeable {
     private class HttpRequest implements RpcCallback {
         @Override
         public Map<String, Object> call(Map<?, ?> params) {
-            boolean torProxy = httpClientService.getHttpProxySupplier().getHttpProxy(HttpUsage.DEFAULT).isPresent();
+            List<String> urls = getUrls(params.get("urls"));
+            if(urls.isEmpty()) {
+                log.error("No urls provided in http request");
+                return null;
+            }
 
-            List<String> urls = (List<String>)params.get("urls");
-            String url = urls.stream().filter(u -> u.contains(".onion") == torProxy).findFirst().orElse(urls.get(0));
+            boolean torProxy = httpClientService.getHttpProxySupplier().getHttpProxy(HttpUsage.DEFAULT).isPresent();
+            String url = urls.stream().filter(u -> u.contains(".onion") == torProxy).findFirst().orElse(urls.getFirst());
 
             try {
                 IHttpClient httpClient = httpClientService.getHttpClient(HttpUsage.DEFAULT);
@@ -479,6 +482,14 @@ public class JadeDevice implements Closeable {
             }
 
             return null;
+        }
+
+        private List<String> getUrls(Object urls) {
+            if(urls instanceof List<?> urlList) {
+                return urlList.stream().filter(String.class::isInstance).map(String.class::cast).toList();
+            }
+
+            return Collections.emptyList();
         }
     }
 }

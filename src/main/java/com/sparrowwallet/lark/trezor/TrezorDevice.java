@@ -246,6 +246,8 @@ public class TrezorDevice implements Closeable, ProtocolCallbacks {
                 } else {
                     response = sendResponseCurrent(inputs, outputs, txRequest.getRequestType(), details);
                 }
+            } else {
+                throw new DeviceException("Unexpected response while signing transaction: " + response.getClass().getSimpleName());
             }
         }
 
@@ -270,6 +272,9 @@ public class TrezorDevice implements Closeable, ProtocolCallbacks {
     private Message sendResponsePrev(Map<Sha256Hash, PrevTx> prevTxs, TrezorMessageBitcoin.TxRequest.RequestType requestType,
                                      TrezorMessageBitcoin.TxRequest.TxRequestDetailsType details) throws DeviceException {
         PrevTx prevTx = prevTxs.get(Sha256Hash.wrap(details.getTxHash().toByteArray()));
+        if(prevTx == null) {
+            throw new DeviceException("This device requires the full previous transaction for every input, which is omitted from some PSBTs, such as those transferred via QR");
+        }
         if(requestType == TrezorMessageBitcoin.TxRequest.RequestType.TXINPUT) {
             TrezorMessageBitcoin.PrevInput prevInput = prevTx.prevInputs().get(details.getRequestIndex());
             TrezorMessageBitcoin.TxAckPrevInput txAckPrevInput = TrezorMessageBitcoin.TxAckPrevInput.newBuilder()
@@ -384,7 +389,13 @@ public class TrezorDevice implements Closeable, ProtocolCallbacks {
     }
 
     public String getCoinName(Network network) {
-        return network == Network.MAINNET ? "Litecoin" : "Testnet";
+        if(network == Network.MAINNET) {
+            return "Litecoin";
+        } else if(network == Network.REGTEST && !model.equals(TrezorModel.KEEPKEY)) {
+            return "Regtest";
+        }
+
+        return "Testnet";
     }
 
     public <T extends Message> T call(Message message, Class<T> toValueType) throws DeviceException {

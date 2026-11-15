@@ -5,6 +5,7 @@ import com.sparrowwallet.drongo.*;
 import com.sparrowwallet.drongo.crypto.ChildNumber;
 import com.sparrowwallet.drongo.protocol.ScriptType;
 import com.sparrowwallet.drongo.psbt.PSBT;
+import com.sparrowwallet.drongo.silentpayments.SilentPaymentScanAddress;
 import com.sparrowwallet.drongo.wallet.WalletModel;
 import com.sparrowwallet.lark.bitbox02.BitBoxNoiseConfig;
 import com.sparrowwallet.lark.trezor.TrezorNoiseConfig;
@@ -133,6 +134,8 @@ public class Lark {
                     } else {
                         throw e;
                     }
+                } catch(Exception e) {
+                    handleDeviceError(hidDevice.getProduct(), hardwareClient, clientOperation, e);
                 }
             }
         } finally {
@@ -165,6 +168,8 @@ public class Lark {
                 } else {
                     throw e;
                 }
+            } catch(Exception e) {
+                handleDeviceError(serialPort.getDescriptivePortName(), hardwareClient, clientOperation, e);
             }
         }
     }
@@ -216,6 +221,8 @@ public class Lark {
                     } else {
                         throw e;
                     }
+                } catch(Exception e) {
+                    handleDeviceError("webusb device", hardwareClient, clientOperation, e);
                 }
             }
         } finally {
@@ -223,6 +230,21 @@ public class Lark {
             if(context.getPointer() != 0) {
                 LibUsb.exit(context);
             }
+        }
+    }
+
+    /**
+     * Handles an unchecked exception thrown while communicating with a device. A device is free to return any bytes it likes,
+     * so a malformed response can surface as any runtime exception, and one misbehaving device must not abort the enumeration of the others.
+     */
+    private void handleDeviceError(String deviceDescription, HardwareClient hardwareClient, ClientOperation clientOperation, Exception e) throws DeviceException {
+        log.error("Error communicating with " + deviceDescription, e);
+        String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+
+        if(hardwareClient != null && clientOperation instanceof InitializeFingerprintOperation) {
+            hardwareClient.setError("Error communicating with device: " + message);
+        } else {
+            throw new DeviceException("Error communicating with " + deviceDescription + ": " + message, e);
         }
     }
 
@@ -267,6 +289,49 @@ public class Lark {
         GetXpubOperation getXpubOperation = new GetXpubOperation(fingerprint, path);
         enumerate(getXpubOperation);
         return getXpubOperation.getXpub();
+    }
+
+    /**
+     * Retrieves the silent payments spscan key at the given path.
+     *
+     * @param deviceType the device type
+     * @param path       the derivation path
+     * @return the silent payments spscan key at the given derivation path
+     * @throws DeviceException if an error occurs
+     */
+    public SilentPaymentScanAddress getSpscanAtPath(String deviceType, String path) throws DeviceException {
+        GetSpscanOperation getSpscanOperation = new GetSpscanOperation(deviceType, path);
+        enumerate(getSpscanOperation);
+        return getSpscanOperation.getSpscan();
+    }
+
+    /**
+     * Retrieves the silent payments spscan key at the given path.
+     *
+     * @param deviceType the device type
+     * @param devicePath the device path
+     * @param path       the derivation path
+     * @return the silent payments spscan key at the given derivation path
+     * @throws DeviceException if an error occurs
+     */
+    public SilentPaymentScanAddress getSpscanAtPath(String deviceType, String devicePath, String path) throws DeviceException {
+        GetSpscanOperation getSpscanOperation = new GetSpscanOperation(deviceType, devicePath, path);
+        enumerate(getSpscanOperation);
+        return getSpscanOperation.getSpscan();
+    }
+
+    /**
+     * Retrieves the silent payments spscan key at the given path.
+     *
+     * @param fingerprint the device master fingerprint
+     * @param path        the derivation path
+     * @return the silent payments spscan key at the given derivation path
+     * @throws DeviceException if an error occurs
+     */
+    public SilentPaymentScanAddress getSpscanAtPath(byte[] fingerprint, String path) throws DeviceException {
+        GetSpscanOperation getSpscanOperation = new GetSpscanOperation(fingerprint, path);
+        enumerate(getSpscanOperation);
+        return getSpscanOperation.getSpscan();
     }
 
     /**

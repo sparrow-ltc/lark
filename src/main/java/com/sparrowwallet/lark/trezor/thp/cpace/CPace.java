@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Arrays;
+import java.util.Locale;
 
 /**
  * CPace (Password-Authenticated Key Exchange) implementation for THP Code Entry pairing.
@@ -62,9 +63,7 @@ public class CPace {
 
         if(log.isDebugEnabled()) {
             log.debug("CPace inputs:");
-            log.debug("  Pairing code: {}", pairingCode);
             log.debug("  Handshake hash: {}", Utils.bytesToHex(handshakeHash));
-            log.debug("  Generator: {}", Utils.bytesToHex(generator));
             log.debug("  Trezor pubkey: {}", Utils.bytesToHex(trezorPublicKey));
         }
 
@@ -91,9 +90,7 @@ public class CPace {
 
         if(log.isDebugEnabled()) {
             log.debug("CPace outputs:");
-            log.debug("  Host private (clamped): {}", Utils.bytesToHex(hostPrivateKeyRaw));
             log.debug("  Host pubkey: {}", Utils.bytesToHex(hostPublicKey));
-            log.debug("  Shared secret: {}", Utils.bytesToHex(sharedSecret));
             log.debug("  Tag: {}", Utils.bytesToHex(tag));
         }
 
@@ -143,7 +140,7 @@ public class CPace {
         byte[] hash = Sha256Hash.hash(codeInput);
         BigInteger codeInt = new BigInteger(1, hash).mod(BigInteger.valueOf(1_000_000));
 
-        return String.format("%06d", codeInt.intValue());
+        return String.format(Locale.ROOT, "%06d", codeInt.intValue());
     }
 
     /**
